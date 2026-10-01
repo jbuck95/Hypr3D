@@ -16,6 +16,7 @@
 #include <hyprland/src/devices/IPointer.hpp>
 #include <hyprland/src/pointer/PointerManager.hpp>
 #include <hyprland/src/pointer/PointerController.hpp>
+#include <hyprland/src/state/MonitorState.hpp>
 #include <hyprutils/memory/UniquePtr.hpp>
 
 // This system's lua headers (5.5) lost the extern "C" guard: including them
@@ -251,6 +252,7 @@ static bool g_hookInstalled = false;
 // names; wrong-typed keys raise a lua error. Everything is clamped on set.
 // --- world ------------------------------------------------------------------
 static std::string g_cfgPanorama;                // panorama image path
+static std::string g_cfgMonitor;                 // monitor name (e.g. "DP-1"), empty = focused
 static bool        g_cfgGrid = true;             // base grid platform on/off
 
 // --- windows ----------------------------------------------------------------
@@ -271,6 +273,7 @@ static Vec3 g_playerSpawn{0.0f, 0.0f, 0.0f};
 // Walking physics state.
 static bool  g_grounded    = false;
 static float g_verticalVel = 0.0f;
+static void toggleFlying();
 
 // --- map --------------------------------------------------------------------
 static std::string g_cfgMapPath;
@@ -383,9 +386,18 @@ static void damageCurrentMonitor() {
     );
 }
 
-// The monitor the 3D view is built for: whatever has keyboard focus, falling
-// back to whatever render.pre last reported.
+static PHLMONITOR g_currentRenderMon = nullptr;
+
+// The monitor the 3D view is built for: configured monitor, or focused monitor,
+// falling back to whatever render.pre last reported.
 static PHLMONITOR targetMonitor() {
+    if (!g_cfgMonitor.empty() && State::monitorState()) {
+        for (const auto& mon : State::monitorState()->monitors()) {
+            if (mon && mon->m_name == g_cfgMonitor)
+                return mon;
+        }
+    }
+
     if (const auto FOCUSED = Compat::focusedMonitor())
         return FOCUSED;
 
@@ -1677,14 +1689,18 @@ static void onRenderPre(PHLMONITOR mon) {
     if (g_capturing)
         return;
 
+    const auto TARGET = targetMonitor();
+    if (TARGET && mon != TARGET) {
+        g_currentRenderMon = nullptr;
+        return;
+    }
+
+    g_currentRenderMon = mon;
+
     if (!g_active) {
         g_monitor = mon;
         return;
     }
-
-    const auto FOCUSED = Compat::focusedMonitor();
-    if (FOCUSED && FOCUSED != mon)
-        return;
 
     g_monitor = mon;
     serviceCapture();
@@ -1958,10 +1974,11 @@ static void applyCameraMovement(float dt) {
 
     // Glide toward the key-driven velocity with tau as the time constant;
     // with the keys released the target is zero, so motion decays smoothly.
+    // Flying mode: 3D forward in view direction (true noclip) + vertical / strafe.
     const float SPEED =
         CAM.moveSpeed * (g_keySprint ? 2.5f : 1.0f) * (MOVING ? 1.0f : 0.0f);
     const Vec3 TARGET =
-        CAM.flatForward() * (FORWARD * SPEED) +
+        CAM.forward() * (FORWARD * SPEED) +
         CAM.right() * (STRAFE * SPEED) +
         Vec3{0.f, 1.f, 0.f} * (VERTICAL * SPEED);
 
@@ -2063,10 +2080,10 @@ static void update3D(float dt) {
     const Vec3 PREMOVE = g_scene.camera().position;
     applyCameraMovement(dt);
 
-    // Map collision: a vertical capsule (rounded hull) instead of a box --
-    // walls and seams slide past instead of snagging corners. The flat-floor
-    // clamp in Camera::move stays as the fallback.
-    if (!g_mapCollision.empty()) {
+    // Map collision: active only when NOT flying (flying mode = noclip).
+    // A vertical capsule (rounded hull) instead of a box -- walls and seams
+    // slide past instead of snagging corners.
+    if (!g_mapCollision.empty() && !g_playerFlying) {
         auto& CAM = g_scene.camera();
         const Vec3 DELTA = CAM.position - PREMOVE;
 
@@ -2496,6 +2513,9 @@ static void onRenderStage(eRenderStage stage) {
         return;
 
     if (stage != RENDER_LAST_MOMENT)
+        return;
+
+    if (!g_currentRenderMon || g_currentRenderMon != g_monitor)
         return;
 
     dumpStatus();
@@ -2940,6 +2960,15 @@ static void onKeyboardKey(
         return;
     }
 
+    // Super + G: toggle gravity / flying mode
+    if (PRESSED && ((g_superHeld && (SYM == XKB_KEY_g || SYM == XKB_KEY_G)) ||
+                   (g_keyboardMode == EKeyboardMode::Space && (SYM == XKB_KEY_g || SYM == XKB_KEY_G)))) {
+        toggleFlying();
+        info.cancelled = true;
+        damageCurrentMonitor();
+        return;
+    }
+
     if (PRESSED && g_superHeld && g_altHeld &&
         (SYM == XKB_KEY_Alt_L || SYM == XKB_KEY_Super_L)) {
         g_keyboardMode =
@@ -3110,6 +3139,8 @@ static int luaConfig(lua_State* L) {
     if (idx > 0) {
         if (!SET_STRING(idx, "panorama", g_cfgPanorama, "world.panorama"))
             return luaL_error(L, "hypr3d.config: world.panorama must be a string");
+        if (!SET_STRING(idx, "monitor", g_cfgMonitor, "world.monitor"))
+            return luaL_error(L, "hypr3d.config: world.monitor must be a string");
         if (!SET_BOOL(idx, "grid", g_cfgGrid, "world.grid"))
             return luaL_error(L, "hypr3d.config: world.grid must be a boolean");
         lua_pop(L, 1);
@@ -3212,6 +3243,28 @@ static int luaClose(lua_State*) {
     return 0;
 }
 
+static void toggleFlying() {
+    g_playerFlying = !g_playerFlying;
+    if (!g_playerFlying) {
+        g_verticalVel = 0.0f;
+        g_grounded = false;
+    }
+    notify(
+        std::string("[hypr3d] ") + (g_playerFlying ? "Flugmodus (keine Schwerkraft)" : "Schwerkraft aktiv (Laufen/Springen)"),
+        g_playerFlying ? CHyprColor{0.4f, 0.8f, 1.0f, 1.0f} : CHyprColor{0.4f, 1.0f, 0.4f, 1.0f}
+    );
+}
+
+static int luaToggleFlying(lua_State*) {
+    toggleFlying();
+    return 0;
+}
+
+static SDispatchResult dispatchToggleFlying(std::string) {
+    toggleFlying();
+    return {};
+}
+
 static SDispatchResult dispatchToggle(std::string) {
     toggle3D();
     return {};
@@ -3271,6 +3324,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!HyprlandAPI::addDispatcherV2(PHANDLE, "hypr3d:close", dispatchClose))
         throw std::runtime_error("[hypr3d] failed to register close dispatcher");
 
+    if (!HyprlandAPI::addDispatcherV2(PHANDLE, "hypr3d:toggle_flying", dispatchToggleFlying))
+        throw std::runtime_error("[hypr3d] failed to register toggle_flying dispatcher");
+
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "toggle", luaToggle))
         throw std::runtime_error("[hypr3d] failed to register Lua toggle");
 
@@ -3279,6 +3335,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "close", luaClose))
         throw std::runtime_error("[hypr3d] failed to register Lua close");
+
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "toggle_flying", luaToggleFlying))
+        throw std::runtime_error("[hypr3d] failed to register Lua toggle_flying");
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "config", luaConfig))
         throw std::runtime_error("[hypr3d] failed to register Lua config");

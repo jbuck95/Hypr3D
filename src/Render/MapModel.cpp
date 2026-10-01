@@ -1,6 +1,9 @@
 #define CGLTF_IMPLEMENTATION
 #include "../../third_party/cgltf.h"
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 #include <GLES3/gl32.h>
 
 #include "Render/MapModel.hpp"
@@ -72,6 +75,7 @@ in vec3 vNormal;
 in vec2 vUV;
 
 uniform sampler2D uTex;
+uniform int uHasTex;
 uniform vec4 uColor;
 uniform sampler2D uEmissive;
 uniform int uHasEmissive;
@@ -84,12 +88,13 @@ uniform float uAlphaCutoff;  // mask cutoff
 out vec4 fragColor;
 
 void main() {
-    vec3 base = uColor.rgb * texture(uTex, vUV).rgb;
+    vec4 texColor = (uHasTex != 0) ? texture(uTex, vUV) : vec4(1.0);
+    vec3 base = uColor.rgb * texColor.rgb;
 
     // glTF alpha: baseColor alpha = factor.a * texture.a. Opaque forces 1;
     // mask discards below the cutoff; blend passes it through (the draw
     // call enables blending only for the blend pass).
-    float alpha = uColor.a * texture(uTex, vUV).a;
+    float alpha = uColor.a * texColor.a;
     if (uAlphaMode == 0)
         alpha = 1.0;
 
@@ -99,7 +104,8 @@ void main() {
     // down-facing white lamp panels came out grey at 0.64x while the author
     // intended them bright. Show albedo/emission exactly as authored, like
     // Blender's view of a baked map.
-    if (uFlat != 0) {
+    // Untextured primitives have no baked lighting in texture, so always shade dynamically.
+    if (uFlat != 0 && uHasTex != 0) {
         if (uHasEmissive != 0) {
             vec3 e = texture(uEmissive, vUV).rgb * uEmissiveFactor *
                 uEmissiveStrength;
@@ -184,48 +190,24 @@ unsigned int CMapModel::uploadTexture(const std::string& modelDir,
                                       bool embedded, const void* data, size_t size) {
     auto* image = static_cast<const cgltf_image*>(imagePtr);
 
-    std::unique_ptr<Hyprgraphics::CImage> img;
+    int W = 0, H = 0, channels = 0;
+    unsigned char* pixels = nullptr;
 
-    if (embedded) {
-        img = std::make_unique<Hyprgraphics::CImage>(
-            std::span<const uint8_t>{static_cast<const uint8_t*>(data), size},
-            Hyprgraphics::IMAGE_FORMAT_AUTO);
+    if (embedded && data && size > 0) {
+        pixels = stbi_load_from_memory(
+            static_cast<const stbi_uc*>(data),
+            static_cast<int>(size),
+            &W, &H, &channels, 4);
     } else if (image && image->uri &&
                !std::string_view{image->uri}.starts_with("data:")) {
-        img = std::make_unique<Hyprgraphics::CImage>(modelDir + "/" + image->uri);
-    } else {
-        return 0; // data URIs are rare in maps; skip rather than fail
+        const std::string fullPath = modelDir + "/" + image->uri;
+        pixels = stbi_load(fullPath.c_str(), &W, &H, &channels, 4);
     }
 
-    auto surface = (img && img->success()) ? img->cairoSurface() : nullptr;
-
-    if (!surface || surface->status() != CAIRO_STATUS_SUCCESS)
+    if (!pixels || W <= 0 || H <= 0) {
+        if (pixels)
+            stbi_image_free(pixels);
         return 0;
-
-    const int W      = static_cast<int>(surface->size().x);
-    const int H      = static_cast<int>(surface->size().y);
-    const int STRIDE = surface->stride();
-    const auto* SRC  = surface->data();
-
-    if (W <= 0 || H <= 0 || !SRC)
-        return 0;
-
-    // Cairo ARGB32 is premultiplied BGRA; textures want RGBA. NO row flip:
-    // glTF's UV origin is the image TOP-LEFT with v growing down, and GL's
-    // v = 0 samples the first uploaded row -- so cairo row 0 (the top) must
-    // land in the first texel row. Flipping here mirrors every texture.
-    std::vector<unsigned char> pixels(static_cast<size_t>(W) * H * 4);
-
-    for (int y = 0; y < H; ++y) {
-        const auto* row = SRC + static_cast<size_t>(y) * STRIDE;
-        auto*       dst = pixels.data() + static_cast<size_t>(y) * W * 4;
-
-        for (int x = 0; x < W; ++x) {
-            dst[x * 4 + 0] = row[x * 4 + 2];
-            dst[x * 4 + 1] = row[x * 4 + 1];
-            dst[x * 4 + 2] = row[x * 4 + 0];
-            dst[x * 4 + 3] = row[x * 4 + 3];
-        }
     }
 
     unsigned int tex = 0;
@@ -238,10 +220,11 @@ unsigned int CMapModel::uploadTexture(const std::string& modelDir,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
 
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                 pixels.data());
+                 pixels);
     glGenerateMipmap(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, 0);
 
+    stbi_image_free(pixels);
     return tex;
 }
 
@@ -290,6 +273,7 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
                 m_uModel  = glGetUniformLocation(P, "uModel");
                 m_uColor  = glGetUniformLocation(P, "uColor");
                 m_uTex    = glGetUniformLocation(P, "uTex");
+                m_uHasTex = glGetUniformLocation(P, "uHasTex");
                 m_uEmissive         = glGetUniformLocation(P, "uEmissive");
                 m_uHasEmissive      = glGetUniformLocation(P, "uHasEmissive");
                 m_uEmissiveFactor   = glGetUniformLocation(P, "uEmissiveFactor");
@@ -304,6 +288,19 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
             glDeleteShader(VS);
         if (FS)
             glDeleteShader(FS);
+    }
+
+    if (!m_whiteTexture) {
+        const uint32_t whitePixel = 0xFFFFFFFF;
+        glGenTextures(1, &m_whiteTexture);
+        glBindTexture(GL_TEXTURE_2D, m_whiteTexture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                     &whitePixel);
+        glBindTexture(GL_TEXTURE_2D, 0);
     }
 
     const std::string MODEL_DIR =
@@ -583,6 +580,11 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
 }
 
 void CMapModel::destroy() {
+    if (m_whiteTexture) {
+        glDeleteTextures(1, &m_whiteTexture);
+        m_whiteTexture = 0;
+    }
+
     if (!m_ownedTextures.empty()) {
         glDeleteTextures(static_cast<GLsizei>(m_ownedTextures.size()),
                          m_ownedTextures.data());
@@ -778,6 +780,7 @@ void CMapModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
     glUniform1i(m_uFlat, m_flat ? 1 : 0);
 
     glEnable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
 
     glActiveTexture(GL_TEXTURE0);
 
@@ -794,11 +797,12 @@ void CMapModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
         glUniform3f(m_uEmissiveFactor, P.emissiveFactor[0], P.emissiveFactor[1],
                     P.emissiveFactor[2]);
         glUniform1f(m_uEmissiveStrength, P.emissiveStrength * m_emissiveScale);
+        glUniform1i(m_uHasTex, P.texture != 0 ? 1 : 0);
 
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, P.emissiveTex);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, P.texture);
+        glBindTexture(GL_TEXTURE_2D, P.texture ? P.texture : m_whiteTexture);
 
         glBindVertexArray(P.vao);
         glDrawElements(GL_TRIANGLES, P.count, GL_UNSIGNED_INT,
